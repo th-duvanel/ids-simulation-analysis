@@ -1,0 +1,11 @@
+*.pcap
+*.csv
+*.dat
+*.txt
+*.log
+
+/build/
+
+simulacao
+
+.DS_Store
