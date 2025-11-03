@@ -2,31 +2,19 @@
 #include "ns3/network-module.h"
 #include "ns3/internet-module.h"
 #include "ns3/point-to-point-module.h"
-// #include "ns3/point-to-point-layout-module.h" // --- MUDANÇA: Não precisamos mais disto
 #include "ns3/applications-module.h"
+#include "ns3/traffic-control-module.h"
 #include "ns3/ipv4-global-routing-helper.h"
-
-//
-// Simulação de Saturação de NIDS (v3 - Corrigido para ns-3.46.1)
-//
-// Topologia:
-// [5 Clientes Fundo] ----.
-//                       |
-// [1 Cliente Ataque] ---+---> [Roteador/NIDS] ---> [Servidor Vítima]
-//
-// NIDS: Modelado como uma fila "DropTailQueue" com limite de *pacotes*.
-//
+#include "ns3/flow-monitor-module.h"
 
 using namespace ns3;
 
-NS_LOG_COMPONENT_DEFINE("NidsSaturacaoSim");
+NS_LOG_COMPONENT_DEFINE("NidsSaturacaoSimV9");
 
-// --- Contadores Globais para Métricas ---
 static uint64_t g_totalPacotesFila = 0;
 static uint64_t g_totalDescartes = 0;
-static uint64_t g_descartesAtaque = 0; // Pacotes de ataque (Porta 80) descartados
-
-// --- Callbacks (Funções de Coleta de Dados) ---
+static uint64_t g_descartesAtaque = 0;
+static Ptr<PacketSink> g_sinkLegitimo;
 
 static void PacoteNaFila(Ptr<const Packet> p)
 {
@@ -36,41 +24,50 @@ static void PacoteNaFila(Ptr<const Packet> p)
 static void PacoteDescartado(Ptr<const Packet> p)
 {
     g_totalDescartes++;
+    if (g_totalDescartes == 1)
+    {
+        NS_LOG_UNCOND("--- PRIMEIRO PACOTE DESCARTADO --- O GARGALO ESTÁ FUNCIONANDO!");
+    }
+
     Ptr<Packet> packet = p->Copy();
     Ipv4Header ipv4;
     UdpHeader udp;
-    if (packet->PeekHeader(ipv4) && packet->PeekHeader(udp))
+
+    if (packet->RemoveHeader(ipv4))
     {
-        if (udp.GetDestinationPort() == 80)
+        if (packet->RemoveHeader(udp))
         {
-            g_descartesAtaque++;
+            if (udp.GetDestinationPort() == 80)
+            {
+                g_descartesAtaque++;
+            }
         }
     }
 }
 
-// --- Função Principal ---
+void PacoteDescartadoDisc(Ptr<const QueueDiscItem> item) {
+    PacoteDescartado(item->GetPacket());
+}
 
 int main(int argc, char* argv[])
 {
-    // --- 1. Configuração dos Parâmetros ---
     double taxaPpsFundoPorCliente = 5000;
-    uint32_t tamanhoFilaNids = 100;
-    uint32_t semente = 1;
     uint32_t packetSizeFundo = 128;
     std::string nidsDataRate = "30Mbps";
+    std::string tamanhoFilaNids = "100p";
+    uint32_t semente = 1;
 
     CommandLine cmd;
-    cmd.AddValue("taxaPpsFundo", "Taxa de pacotes por segundo (pps) para cada cliente de fundo", taxaPpsFundoPorCliente);
-    cmd.AddValue("tamanhoFila", "Tamanho da fila do NIDS em pacotes", tamanhoFilaNids);
-    cmd.AddValue("semente", "Semente do gerador aleatório", semente);
+    cmd.AddValue("taxaPpsFundo", "Taxa (pps) de cada cliente de fundo", taxaPpsFundoPorCliente);
+    cmd.AddValue("packetSizeFundo", "Tamanho (bytes) dos pacotes de fundo", packetSizeFundo);
     cmd.AddValue("nidsDataRate", "Capacidade (DataRate) do link do NIDS", nidsDataRate);
-    cmd.AddValue("packetSizeFundo", "Tamanho do pacote de fundo em bytes", packetSizeFundo);
+    cmd.AddValue("tamanhoFilaNids", "Tamanho da fila (ex: '100p') do NIDS", tamanhoFilaNids);
+    cmd.AddValue("semente", "Semente do gerador aleatório", semente);
     cmd.Parse(argc, argv);
 
     RngSeedManager::SetSeed(semente);
     double simTime = 10.0;
 
-    // --- 2. Definição da Topologia ---
     uint32_t nClientesFundo = 5;
     NodeContainer nosClientesFundo;
     nosClientesFundo.Create(nClientesFundo);
@@ -78,108 +75,107 @@ int main(int argc, char* argv[])
     NodeContainer noAtacante;
     noAtacante.Create(1);
 
-    NodeContainer noRoteadorNids;
-    noRoteadorNids.Create(1);
-    Ptr<Node> ptrRoteador = noRoteadorNids.Get(0); // Pega o ponteiro do roteador
-
-    NodeContainer noServidor;
-    noServidor.Create(1);
-    Ptr<Node> ptrServidor = noServidor.Get(0); // Pega o ponteiro do servidor
+    NodeContainer noClienteLegitimo;
+    noClienteLegitimo.Create(1);
 
     NodeContainer todosClientes;
     todosClientes.Add(nosClientesFundo);
     todosClientes.Add(noAtacante);
+    todosClientes.Add(noClienteLegitimo);
 
-    // --- 3. Configuração dos Links (Ponto a Ponto) ---
-    // --- MUDANÇA: Lógica de links reescrita (sem StarHelper) ---
+    NodeContainer noRoteadorClientes;
+    noRoteadorClientes.Create(1);
+    Ptr<Node> ptrRoteadorClientes = noRoteadorClientes.Get(0);
 
-    // Helper para o link do hub (roteador) para o servidor (link de saida)
-    PointToPointHelper p2pRoteadorServidor;
-    p2pRoteadorServidor.SetDeviceAttribute("DataRate", StringValue("1Gbps"));
-    p2pRoteadorServidor.SetChannelAttribute("Delay", StringValue("5ms"));
+    NodeContainer noRoteadorNids;
+    noRoteadorNids.Create(1);
+    Ptr<Node> ptrRoteadorNids = noRoteadorNids.Get(0);
 
-    // Helper para os links dos clientes (links de entrada do NIDS)
-    PointToPointHelper p2pClienteRoteador;
-    p2pClienteRoteador.SetDeviceAttribute("DataRate", StringValue(nidsDataRate));
-    p2pClienteRoteador.SetChannelAttribute("Delay", StringValue("5ms"));
-    
-    // A MÁGICA: Definimos a fila do NIDS
-    p2pClienteRoteador.SetQueue("ns3::DropTailQueue",
-                                "MaxSize", StringValue(std::to_string(tamanhoFilaNids) + "p"));
+    NodeContainer noServidor;
+    noServidor.Create(1);
+    Ptr<Node> ptrServidor = noServidor.Get(0);
 
-    // Instala o link Roteador -> Servidor
-    NetDeviceContainer devLinkServidor = p2pRoteadorServidor.Install(ptrRoteador, ptrServidor);
+    NodeContainer todosNos;
+    todosNos.Add(todosClientes);
+    todosNos.Add(noRoteadorClientes);
+    todosNos.Add(noRoteadorNids);
+    todosNos.Add(noServidor);
 
-    // Instala os links Clientes -> Roteador (usando um loop)
-    NetDeviceContainer devsRoteadorParaClientes;
-    NetDeviceContainer devsClientes;
+    PointToPointHelper p2pLinksRapidos;
+    p2pLinksRapidos.SetDeviceAttribute("DataRate", StringValue("1Gbps"));
+    p2pLinksRapidos.SetChannelAttribute("Delay", StringValue("2ms"));
+
+    PointToPointHelper p2pLinkNids;
+    p2pLinkNids.SetDeviceAttribute("DataRate", StringValue(nidsDataRate));
+    p2pLinkNids.SetChannelAttribute("Delay", StringValue("1ms"));
+    p2pLinkNids.SetQueue("ns3::DropTailQueue", "MaxSize", StringValue(tamanhoFilaNids));
+
+    NetDeviceContainer devsClientesRoteador;
+    for (uint32_t i = 0; i < todosClientes.GetN(); ++i)
+    {
+        NetDeviceContainer link = p2pLinksRapidos.Install(todosClientes.Get(i), ptrRoteadorClientes);
+        devsClientesRoteador.Add(link);
+    }
+
+    NetDeviceContainer linkNids = p2pLinkNids.Install(ptrRoteadorClientes, ptrRoteadorNids);
+    NetDeviceContainer linkServidor = p2pLinksRapidos.Install(ptrRoteadorNids, ptrServidor);
+
+    InternetStackHelper stack;
+    stack.Install(todosNos);
+
+    Ipv4AddressHelper addrHelper;
+    Ipv4Address ipServidor;
+    Ipv4Address ipLegitimo;
 
     for (uint32_t i = 0; i < todosClientes.GetN(); ++i)
     {
-        NetDeviceContainer link = p2pClienteRoteador.Install(todosClientes.Get(i), ptrRoteador);
-        
-        devsClientes.Add(link.Get(0)); // Device no lado do cliente
-        devsRoteadorParaClientes.Add(link.Get(1)); // Device no lado do roteador
-    }
-
-    // --- 4. Configuração da Pilha de Rede (Internet) ---
-    InternetStackHelper stack;
-    stack.Install(todosClientes);
-    stack.Install(noRoteadorNids);
-    stack.Install(noServidor);
-
-    // --- MUDANÇA: Lógica de IPs mantida da v2 (é a forma correta) ---
-    Ipv4AddressHelper addrHelper;
-
-    // Link Roteador -> Servidor
-    addrHelper.SetBase("10.1.1.0", "255.255.255.252");
-    Ipv4InterfaceContainer ifaceLinkServidor = addrHelper.Assign(devLinkServidor);
-
-    // Links Clientes -> Roteador (cada um é uma sub-rede /30)
-    Ipv4InterfaceContainer ifacesClientes;
-    for (uint32_t i = 0; i < devsClientes.GetN(); ++i)
-    {
-        std::string subnet = "10.2." + std::to_string(i + 1) + ".0";
-        addrHelper.SetBase(Ipv4Address(subnet.c_str()), "255.255.255.252"); 
-        
         NetDeviceContainer linkDevices;
-        linkDevices.Add(devsClientes.Get(i)); // spoke (cliente)
-        linkDevices.Add(devsRoteadorParaClientes.Get(i)); // hub (roteador)
-        
+        linkDevices.Add(devsClientesRoteador.Get(i * 2));
+        linkDevices.Add(devsClientesRoteador.Get(i * 2 + 1));
+
+        std::string subnet = "10.1." + std::to_string(i + 1) + ".0";
+        addrHelper.SetBase(Ipv4Address(subnet.c_str()), "255.255.255.252");
         Ipv4InterfaceContainer ifacesLink = addrHelper.Assign(linkDevices);
-        ifacesClientes.Add(ifacesLink.Get(0)); // Salva a interface do cliente
+
+        if (i == (nClientesFundo + 1))
+        {
+            ipLegitimo = ifacesLink.GetAddress(0);
+        }
     }
+
+    addrHelper.SetBase("10.2.1.0", "255.255.255.252");
+    addrHelper.Assign(linkNids);
+
+    addrHelper.SetBase("10.3.1.0", "255.255.255.252");
+    Ipv4InterfaceContainer ifaceServidor = addrHelper.Assign(linkServidor);
+    ipServidor = ifaceServidor.GetAddress(1);
 
     Ipv4GlobalRoutingHelper::PopulateRoutingTables();
 
-    // --- 5. Configuração das Aplicações (Tráfego) ---
-    Ipv4Address ipServidor = ifaceLinkServidor.GetAddress(1); // IP do Servidor
-
-    // --- Servidor (Sinks) ---
     uint16_t portFundo = 9;
-    PacketSinkHelper sinkFundo("ns3::UdpSocketFactory",
-                               InetSocketAddress(Ipv4Address::GetAny(), portFundo));
+    PacketSinkHelper sinkFundo("ns3::UdpSocketFactory", InetSocketAddress(Ipv4Address::GetAny(), portFundo));
     ApplicationContainer appsServidor = sinkFundo.Install(noServidor.Get(0));
 
     uint16_t portAtaque = 80;
-    PacketSinkHelper sinkAtaque("ns3::UdpSocketFactory",
-                                InetSocketAddress(Ipv4Address::GetAny(), portAtaque));
+    PacketSinkHelper sinkAtaque("ns3::UdpSocketFactory", InetSocketAddress(Ipv4Address::GetAny(), portAtaque));
     appsServidor.Add(sinkAtaque.Install(noServidor.Get(0)));
+
+    uint16_t portLegitimo = 8080;
+    PacketSinkHelper sinkLegitimo("ns3::TcpSocketFactory", InetSocketAddress(Ipv4Address::GetAny(), portLegitimo));
+    ApplicationContainer appSinkLegitimo = sinkLegitimo.Install(noServidor.Get(0));
+    g_sinkLegitimo = DynamicCast<PacketSink>(appSinkLegitimo.Get(0));
+    appsServidor.Add(appSinkLegitimo);
+
     appsServidor.Start(Seconds(0.0));
     appsServidor.Stop(Seconds(simTime));
 
-    // --- Clientes de Fundo (VI) ---
     ApplicationContainer appsClientesFundo;
-    
     std::string dataRateFundo = std::to_string(taxaPpsFundoPorCliente * packetSizeFundo * 8) + "bps";
-
-    OnOffHelper onoffFundo("ns3::UdpSocketFactory",
-                           InetSocketAddress(ipServidor, portFundo));
+    OnOffHelper onoffFundo("ns3::UdpSocketFactory", InetSocketAddress(ipServidor, portFundo));
     onoffFundo.SetAttribute("PacketSize", UintegerValue(packetSizeFundo));
     onoffFundo.SetAttribute("DataRate", StringValue(dataRateFundo));
     onoffFundo.SetAttribute("OnTime", StringValue("ns3::ConstantRandomVariable[Constant=1]"));
     onoffFundo.SetAttribute("OffTime", StringValue("ns3::ConstantRandomVariable[Constant=0]"));
-
     for (uint32_t i = 0; i < nClientesFundo; ++i)
     {
         appsClientesFundo.Add(onoffFundo.Install(nosClientesFundo.Get(i)));
@@ -187,57 +183,105 @@ int main(int argc, char* argv[])
     appsClientesFundo.Start(Seconds(1.0));
     appsClientesFundo.Stop(Seconds(simTime - 1.0));
 
-    // --- Cliente Atacante (Tráfego Alvo) ---
-    // --- Cliente Atacante (Tráfego Alvo) ---
-    uint32_t packetSizeAtaque = 1024; // Pacote "SQLi"
-    uint32_t totalPacotesAtaque = 100; // Denominador Fixo para VD2
-    
-    // Calcula o total de bytes a serem enviados
+    uint32_t packetSizeAtaque = 1024;
+    uint32_t totalPacotesAtaque = 100;
     uint32_t totalBytesAtaque = packetSizeAtaque * totalPacotesAtaque;
-
-    OnOffHelper onoffAtaque("ns3::UdpSocketFactory", // Garanta que aqui é UdpSocketFactory
-                            InetSocketAddress(ipServidor, portAtaque));
+    OnOffHelper onoffAtaque("ns3::UdpSocketFactory", InetSocketAddress(ipServidor, portAtaque));
     onoffAtaque.SetAttribute("PacketSize", UintegerValue(packetSizeAtaque));
-    onoffAtaque.SetAttribute("DataRate", StringValue("500kbps")); // Taxa baixa
-    onoffAtaque.SetAttribute("MaxBytes", UintegerValue(totalBytesAtaque)); // <-- CORREÇÃO
+    onoffAtaque.SetAttribute("DataRate", StringValue("500kbps"));
+    onoffAtaque.SetAttribute("MaxBytes", UintegerValue(totalBytesAtaque));
     onoffAtaque.SetAttribute("OnTime", StringValue("ns3::ConstantRandomVariable[Constant=1]"));
     onoffAtaque.SetAttribute("OffTime", StringValue("ns3::ConstantRandomVariable[Constant=0]"));
-
     ApplicationContainer appsAtacante = onoffAtaque.Install(noAtacante.Get(0));
     appsAtacante.Start(Seconds(2.0));
     appsAtacante.Stop(Seconds(simTime - 2.0));
 
+    BulkSendHelper bulkSend("ns3::TcpSocketFactory", InetSocketAddress(ipServidor, portLegitimo));
+    bulkSend.SetAttribute("MaxBytes", UintegerValue(0));
+    ApplicationContainer appClienteLegitimo = bulkSend.Install(noClienteLegitimo.Get(0));
+    appClienteLegitimo.Start(Seconds(1.0));
+    appClienteLegitimo.Stop(Seconds(simTime));
 
-    // --- 6. Coleta de Dados (TraceConnect) ---
-    // A lógica está correta, pois 'devsRoteadorParaClientes' foi preenchido no loop
-    for (uint32_t i = 0; i < devsRoteadorParaClientes.GetN(); ++i)
+    Ptr<NetDevice> devNidsSaida = linkNids.Get(0);
+    Ptr<PointToPointNetDevice> p2pDev = DynamicCast<PointToPointNetDevice>(devNidsSaida);
+    Ptr<Queue<Packet>> filaNids = p2pDev->GetQueue();
+    filaNids->TraceConnectWithoutContext("Enqueue", MakeCallback(&PacoteNaFila));
+
+    Ptr<TrafficControlLayer> tc = p2pDev->GetNode()->GetObject<TrafficControlLayer>();
+    if (tc != nullptr)
     {
-        Ptr<NetDevice> devNids = devsRoteadorParaClientes.Get(i);
-        Ptr<PointToPointNetDevice> p2pDevNids = DynamicCast<PointToPointNetDevice>(devNids);
-        Ptr<Queue<Packet>> filaNids = p2pDevNids->GetQueue();
-
-        filaNids->TraceConnectWithoutContext("Enqueue", MakeCallback(&PacoteNaFila));
-        filaNids->TraceConnectWithoutContext("Drop", MakeCallback(&PacoteDescartado));
+        Ptr<QueueDisc> queueDiscNids = tc->GetRootQueueDiscOnDevice(p2pDev);
+        if (queueDiscNids != nullptr)
+        {
+            queueDiscNids->TraceConnectWithoutContext("Drop", MakeCallback(&PacoteDescartadoDisc));
+        }
+        else
+        {
+            NS_LOG_UNCOND("Nenhum QueueDisc encontrado no dispositivo NIDS");
+        }
+    }
+    else
+    {
+        NS_LOG_UNCOND("Nenhum TrafficControlLayer encontrado no node do dispositivo NIDS");
     }
 
+    FlowMonitorHelper flowmonHelper;
+    Ptr<FlowMonitor> monitor = flowmonHelper.InstallAll();
+    Ptr<Ipv4FlowClassifier> classifier = DynamicCast<Ipv4FlowClassifier>(flowmonHelper.GetClassifier());
 
-    // --- 7. Execução e Resultados ---
     Simulator::Stop(Seconds(simTime + 1.0));
     Simulator::Run();
 
-    // --- Cálculo das Métricas Finais ---
+    NS_LOG_UNCOND("--- Contadores Finais ---");
+    NS_LOG_UNCOND("Total Pacotes Enfileirados: " << g_totalPacotesFila);
+    NS_LOG_UNCOND("Total Pacotes Descartados: " << g_totalDescartes);
+    NS_LOG_UNCOND("Total Ataques Descartados (FN): " << g_descartesAtaque);
+
     double taxaDescarteGeral = 0.0;
-    if (g_totalPacotesFila > 0) // Evita divisão por zero
+    if (g_totalPacotesFila > 0)
     {
         taxaDescarteGeral = (double)g_totalDescartes / g_totalPacotesFila;
     }
-    
-    double taxaDeteccaoAtaque = (double)(totalPacotesAtaque - g_descartesAtaque) / totalPacotesAtaque;
+
+    double taxaFalsosNegativos = (double)g_descartesAtaque / totalPacotesAtaque;
+
+    double throughputLegitimoMbps = 0.0;
+    if (g_sinkLegitimo)
+    {
+        uint64_t totalBytesRecebidos = g_sinkLegitimo->GetTotalRx();
+        NS_LOG_UNCOND("Total Bytes TCP Recebidos: " << totalBytesRecebidos);
+        double duracaoApp = simTime - 1.0;
+        throughputLegitimoMbps = (totalBytesRecebidos * 8.0) / (duracaoApp * 1000000.0);
+    }
+
+    monitor->CheckForLostPackets();
+    FlowMonitor::FlowStatsContainer stats = monitor->GetFlowStats();
+    double mediaLatencia = 0.0;
+
+    for (auto const& kv : stats)
+    {
+        uint32_t flowId = kv.first;
+        FlowMonitor::FlowStats flowStats = kv.second;
+        Ipv4FlowClassifier::FiveTuple t = classifier->FindFlow(flowId);
+
+        if (t.sourceAddress == ipLegitimo &&
+            t.destinationAddress == ipServidor &&
+            t.destinationPort == portLegitimo)
+        {
+            if (flowStats.rxPackets > 0)
+            {
+                mediaLatencia = flowStats.delaySum.GetSeconds() / flowStats.rxPackets;
+                NS_LOG_UNCOND("Latência Média TCP: " << mediaLatencia << "s");
+            }
+            break;
+        }
+    }
 
     std::cout << "RESULT,"
-              << taxaPpsFundoPorCliente * nClientesFundo << "," // VI (Total PPS)
-              << taxaDescarteGeral << ","                     // VD1
-              << taxaDeteccaoAtaque << std::endl;             // VD2
+              << taxaDescarteGeral << ","
+              << taxaFalsosNegativos << ","
+              << throughputLegitimoMbps << ","
+              << mediaLatencia << std::endl;
 
     Simulator::Destroy();
     return 0;
