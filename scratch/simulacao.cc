@@ -2,6 +2,7 @@
 #include "ns3/network-module.h"
 #include "ns3/internet-module.h"
 #include "ns3/point-to-point-module.h"
+#include "ns3/ppp-header.h"
 #include "ns3/applications-module.h"
 #include "ns3/traffic-control-module.h"
 #include "ns3/ipv4-global-routing-helper.h"
@@ -13,8 +14,24 @@ NS_LOG_COMPONENT_DEFINE("NidsSaturacaoSimV9");
 
 static uint64_t g_totalPacotesFila = 0;
 static uint64_t g_totalDescartes = 0;
-static uint64_t g_descartesAtaque = 0;
 static Ptr<PacketSink> g_sinkLegitimo;
+static Ptr<PacketSink> g_sinkAtaque;
+// --- CPU (Inspeção) Fail-Open Model ---
+static double g_nidsCpuPps = 50000.0;            // Capacidade de inspeção (pps)
+static double g_tokensDisponiveis = 0.0;         // Tokens restantes neste segundo
+static uint64_t g_totalInspecionados = 0;        // Pacotes efetivamente inspecionados
+static uint64_t g_totalBypassCpu = 0;            // Pacotes que passaram sem inspeção (fail-open)
+static uint64_t g_totalAtaquesBypassCpu = 0;     // Pacotes de ataque que bypassaram inspeção (false negatives)
+static uint64_t g_totalAtaquesInspecionados = 0; // Pacotes de ataque inspecionados
+static uint64_t g_totalAtaquesDetectados = 0;    // Pacotes de ataque "dropados" pela inspeção (detecções verdadeiras)
+static uint64_t g_totalAtaquesEnviados = 0;      // Total de pacotes de ataque gerados (previsto)
+static bool g_exaustaoCpuNotificada = false;     // Marca primeira exaustão de CPU
+
+static void RefillCpuTokens()
+{
+    g_tokensDisponiveis = g_nidsCpuPps; // reabastece capacidade para o próximo segundo
+    Simulator::Schedule(Seconds(1.0), &RefillCpuTokens);
+}
 
 static void PacoteNaFila(Ptr<const Packet> p)
 {
@@ -23,30 +40,74 @@ static void PacoteNaFila(Ptr<const Packet> p)
 
 static void PacoteDescartado(Ptr<const Packet> p)
 {
+    // Em nível de fila do dispositivo, não temos L3; apenas conte descartes gerais.
     g_totalDescartes++;
-    if (g_totalDescartes == 1)
-    {
-        NS_LOG_UNCOND("--- PRIMEIRO PACOTE DESCARTADO --- O GARGALO ESTÁ FUNCIONANDO!");
-    }
-
-    Ptr<Packet> packet = p->Copy();
-    Ipv4Header ipv4;
-    UdpHeader udp;
-
-    if (packet->RemoveHeader(ipv4))
-    {
-        if (packet->RemoveHeader(udp))
-        {
-            if (udp.GetDestinationPort() == 80)
-            {
-                g_descartesAtaque++;
-            }
-        }
-    }
 }
 
 void PacoteDescartadoDisc(Ptr<const QueueDiscItem> item) {
     PacoteDescartado(item->GetPacket());
+}
+
+// Callback de recepção (inspeção lógica) do NIDS
+static void PacoteRecebidoNoNids(Ptr<const Packet> p)
+{
+    // Tentar inspecionar; se saturado, fail-open permite passagem.
+    bool ehAtaque = false;
+    // Recriar headers: fila do PointToPoint contém PPP + IPv4 + UDP
+    Ptr<Packet> copia = p->Copy();
+    PppHeader ppp;
+    if (copia->RemoveHeader(ppp))
+    {
+        const uint16_t PPP_PROTO_IPV4 = 0x0021;
+        if (ppp.GetProtocol() == PPP_PROTO_IPV4)
+        {
+            Ipv4Header ip4;
+            if (copia->RemoveHeader(ip4))
+            {
+                const uint8_t PROTO_UDP = 17;
+                if (ip4.GetProtocol() == PROTO_UDP)
+                {
+                    UdpHeader udp;
+                    if (copia->RemoveHeader(udp))
+                    {
+                        // Porta de ataque fixa (80 UDP)
+                        ehAtaque = (udp.GetDestinationPort() == 80);
+                    }
+                }
+            }
+        }
+    }
+
+    if (g_tokensDisponiveis >= 1.0)
+    {
+        g_tokensDisponiveis -= 1.0;
+        g_totalInspecionados++;
+        if (ehAtaque)
+        {
+            g_totalAtaquesInspecionados++;
+            g_totalAtaquesDetectados++; // considerado drop lógico (não deixaria passar em cenário ideal)
+            // Observação: não removemos fisicamente o pacote; detecção é lógica.
+        }
+    }
+    else
+    {
+        g_totalBypassCpu++;
+        if (!g_exaustaoCpuNotificada)
+        {
+            NS_LOG_UNCOND("--- EXAUSTÃO DE CPU NIDS: FAIL-OPEN INICIADO ---");
+            g_exaustaoCpuNotificada = true;
+        }
+        if (ehAtaque)
+        {
+            g_totalAtaquesBypassCpu++; // falso negativo
+        }
+    }
+}
+
+// Bridge para o trace Dequeue da fila do NIDS (precisa vir DEPOIS da definição de PacoteRecebidoNoNids)
+static void OnDequeueNids(Ptr<const Packet> p)
+{
+    PacoteRecebidoNoNids(p);
 }
 
 int main(int argc, char* argv[])
@@ -56,6 +117,7 @@ int main(int argc, char* argv[])
     std::string nidsDataRate = "30Mbps";
     std::string tamanhoFilaNids = "100p";
     uint32_t semente = 1;
+    double nidsCpuPps = 50000.0; // capacidade default
 
     CommandLine cmd;
     cmd.AddValue("taxaPpsFundo", "Taxa (pps) de cada cliente de fundo", taxaPpsFundoPorCliente);
@@ -63,7 +125,12 @@ int main(int argc, char* argv[])
     cmd.AddValue("nidsDataRate", "Capacidade (DataRate) do link do NIDS", nidsDataRate);
     cmd.AddValue("tamanhoFilaNids", "Tamanho da fila (ex: '100p') do NIDS", tamanhoFilaNids);
     cmd.AddValue("semente", "Semente do gerador aleatório", semente);
+    cmd.AddValue("nidsCpuPps", "Capacidade de inspeção do NIDS (pps)", nidsCpuPps);
     cmd.Parse(argc, argv);
+
+    g_nidsCpuPps = nidsCpuPps;
+    g_tokensDisponiveis = g_nidsCpuPps; // iniciar com capacidade cheia
+    Simulator::Schedule(Seconds(1.0), &RefillCpuTokens);
 
     RngSeedManager::SetSeed(semente);
     double simTime = 10.0;
@@ -157,8 +224,10 @@ int main(int argc, char* argv[])
     ApplicationContainer appsServidor = sinkFundo.Install(noServidor.Get(0));
 
     uint16_t portAtaque = 80;
-    PacketSinkHelper sinkAtaque("ns3::UdpSocketFactory", InetSocketAddress(Ipv4Address::GetAny(), portAtaque));
-    appsServidor.Add(sinkAtaque.Install(noServidor.Get(0)));
+    PacketSinkHelper sinkAtaqueHelper("ns3::UdpSocketFactory", InetSocketAddress(Ipv4Address::GetAny(), portAtaque));
+    ApplicationContainer appSinkAtaque = sinkAtaqueHelper.Install(noServidor.Get(0));
+    g_sinkAtaque = DynamicCast<PacketSink>(appSinkAtaque.Get(0));
+    appsServidor.Add(appSinkAtaque);
 
     uint16_t portLegitimo = 8080;
     PacketSinkHelper sinkLegitimo("ns3::TcpSocketFactory", InetSocketAddress(Ipv4Address::GetAny(), portLegitimo));
@@ -195,6 +264,19 @@ int main(int argc, char* argv[])
     ApplicationContainer appsAtacante = onoffAtaque.Install(noAtacante.Get(0));
     appsAtacante.Start(Seconds(2.0));
     appsAtacante.Stop(Seconds(simTime - 2.0));
+    g_totalAtaquesEnviados = totalPacotesAtaque;
+
+    // Log periódico de estado de CPU (a cada segundo)
+    for (uint32_t s = 1; s <= (uint32_t)simTime; ++s)
+    {
+        Simulator::Schedule(Seconds(s), [](){
+            NS_LOG_UNCOND("[CPU] t=" << Simulator::Now().GetSeconds()
+                           << "s tokens_restantes=" << g_tokensDisponiveis
+                           << " inspecionados=" << g_totalInspecionados
+                           << " bypass=" << g_totalBypassCpu
+                           << " ataques_bypass=" << g_totalAtaquesBypassCpu);
+        });
+    }
 
     BulkSendHelper bulkSend("ns3::TcpSocketFactory", InetSocketAddress(ipServidor, portLegitimo));
     bulkSend.SetAttribute("MaxBytes", UintegerValue(0));
@@ -206,6 +288,11 @@ int main(int argc, char* argv[])
     Ptr<PointToPointNetDevice> p2pDev = DynamicCast<PointToPointNetDevice>(devNidsSaida);
     Ptr<Queue<Packet>> filaNids = p2pDev->GetQueue();
     filaNids->TraceConnectWithoutContext("Enqueue", MakeCallback(&PacoteNaFila));
+    // Conecta drop direto na fila (não depende de QueueDisc)
+    filaNids->TraceConnectWithoutContext("Drop", MakeCallback(&PacoteDescartado));
+
+    // Inspeção lógica ao sair da fila rumo ao NIDS (proxy para "chegada" ao NIDS)
+    filaNids->TraceConnectWithoutContext("Dequeue", MakeCallback(&OnDequeueNids));
 
     Ptr<TrafficControlLayer> tc = p2pDev->GetNode()->GetObject<TrafficControlLayer>();
     if (tc != nullptr)
@@ -235,7 +322,12 @@ int main(int argc, char* argv[])
     NS_LOG_UNCOND("--- Contadores Finais ---");
     NS_LOG_UNCOND("Total Pacotes Enfileirados: " << g_totalPacotesFila);
     NS_LOG_UNCOND("Total Pacotes Descartados: " << g_totalDescartes);
-    NS_LOG_UNCOND("Total Ataques Descartados (FN): " << g_descartesAtaque);
+    // Ataques descartados por fila não são diretamente observáveis aqui (sem L3); ver taxa abaixo.
+    NS_LOG_UNCOND("Total Inspecionados (CPU): " << g_totalInspecionados);
+    NS_LOG_UNCOND("Total Bypass CPU (Fail-Open): " << g_totalBypassCpu);
+    NS_LOG_UNCOND("Ataques Inspecionados: " << g_totalAtaquesInspecionados);
+    NS_LOG_UNCOND("Ataques Detectados (drop lógico): " << g_totalAtaquesDetectados);
+    NS_LOG_UNCOND("Ataques Bypass CPU (FNs): " << g_totalAtaquesBypassCpu);
 
     double taxaDescarteGeral = 0.0;
     if (g_totalPacotesFila > 0)
@@ -243,7 +335,23 @@ int main(int argc, char* argv[])
         taxaDescarteGeral = (double)g_totalDescartes / g_totalPacotesFila;
     }
 
-    double taxaFalsosNegativos = (double)g_descartesAtaque / totalPacotesAtaque;
+    // Falsos negativos definidos como: (Ataques Enviados - Ataques Recebidos no Sink) / Ataques Enviados
+    double ataquesRecebidos = 0.0;
+    if (g_sinkAtaque)
+    {
+        ataquesRecebidos = g_sinkAtaque->GetTotalRx() / (double)packetSizeAtaque;
+    }
+    // False negatives computados estritamente como ataques que bypassaram CPU (não inspecionados) / enviados.
+    double taxaFalsosNegativos = 0.0;
+    if (totalPacotesAtaque > 0)
+    {
+        taxaFalsosNegativos = (double)g_totalAtaquesBypassCpu / (double)totalPacotesAtaque;
+    }
+    NS_LOG_UNCOND("Ataques Enviados: " << totalPacotesAtaque
+                   << " | Recebidos (servidor): " << ataquesRecebidos
+                   << " | Detectados(lógico): " << g_totalAtaquesDetectados
+                   << " | Bypass(FN): " << g_totalAtaquesBypassCpu);
+    NS_LOG_UNCOND("Taxa Falsos Negativos (bypass/enviados): " << taxaFalsosNegativos);
 
     double throughputLegitimoMbps = 0.0;
     if (g_sinkLegitimo)
