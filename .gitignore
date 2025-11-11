@@ -1,10 +1,11 @@
 *.pcap
-*.csv
 *.dat
 *.txt
 *.log
 
 /build/
+/analysis/venv
+/analysis/.ipynb_checkpoints/
 
 simulacao
 

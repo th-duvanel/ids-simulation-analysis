@@ -6,6 +6,7 @@ Este repositório contém um projeto desenvolvido para analisar e simular a efic
 
 ## Como rodar?
 
+Recomendo você seguir todos os passos e colocar a pasta (GitHub) do ns-3 no diretório anterior do diretório principal.
 Com o ns-3.46.1 instalado, você primeiro tem que criar um link simbólico do script de simulação na pasta `scratch/` do ns-3:
 
 ```bash

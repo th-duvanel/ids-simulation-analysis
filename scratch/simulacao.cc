@@ -10,297 +10,281 @@
 
 using namespace ns3;
 
-NS_LOG_COMPONENT_DEFINE("NidsSaturacaoSimV9");
+NS_LOG_COMPONENT_DEFINE("NidsSaturationSimV9");
 
-static uint64_t g_totalPacotesFila = 0;
-static uint64_t g_totalDescartes = 0;
-static Ptr<PacketSink> g_sinkLegitimo;
-static Ptr<PacketSink> g_sinkAtaque;
-// --- CPU (Inspeção) Fail-Open Model ---
-static double g_nidsCpuPps = 50000.0;            // Capacidade de inspeção (pps)
-static double g_tokensDisponiveis = 0.0;         // Tokens restantes neste segundo
-static uint64_t g_totalInspecionados = 0;        // Pacotes efetivamente inspecionados
-static uint64_t g_totalBypassCpu = 0;            // Pacotes que passaram sem inspeção (fail-open)
-static uint64_t g_totalAtaquesBypassCpu = 0;     // Pacotes de ataque que bypassaram inspeção (false negatives)
-static uint64_t g_totalAtaquesInspecionados = 0; // Pacotes de ataque inspecionados
-static uint64_t g_totalAtaquesDetectados = 0;    // Pacotes de ataque "dropados" pela inspeção (detecções verdadeiras)
-static uint64_t g_totalAtaquesEnviados = 0;      // Total de pacotes de ataque gerados (previsto)
-static bool g_exaustaoCpuNotificada = false;     // Marca primeira exaustão de CPU
+static uint64_t g_totalQueuePackets = 0;
+static uint64_t g_totalDrops = 0;
+static Ptr<PacketSink> g_legitimateSink;
+static Ptr<PacketSink> g_attackSink;
+
+static double g_nidsCpuPps = 50000.0;
+static double g_availableTokens = 0.0;
+static uint64_t g_totalInspected = 0;
+static uint64_t g_totalCpuBypass = 0;
+static uint64_t g_totalAttacksCpuBypass = 0;
+static uint64_t g_totalAttacksInspected = 0;
+static uint64_t g_totalAttacksDetected = 0;
+static uint64_t g_totalAttacksSent = 0;
 
 static void RefillCpuTokens()
 {
-    g_tokensDisponiveis = g_nidsCpuPps; // reabastece capacidade para o próximo segundo
+    g_availableTokens = g_nidsCpuPps;
     Simulator::Schedule(Seconds(1.0), &RefillCpuTokens);
 }
 
-static void PacoteNaFila(Ptr<const Packet> p)
+static void OnPacketEnqueued(Ptr<const Packet> p)
 {
-    g_totalPacotesFila++;
+    g_totalQueuePackets++;
 }
 
-static void PacoteDescartado(Ptr<const Packet> p)
+static void OnPacketDropped(Ptr<const Packet> p)
 {
-    // Em nível de fila do dispositivo, não temos L3; apenas conte descartes gerais.
-    g_totalDescartes++;
+    g_totalDrops++;
 }
 
-void PacoteDescartadoDisc(Ptr<const QueueDiscItem> item) {
-    PacoteDescartado(item->GetPacket());
+void OnPacketDroppedDisc(Ptr<const QueueDiscItem> item) {
+    OnPacketDropped(item->GetPacket());
 }
 
-// Callback de recepção (inspeção lógica) do NIDS
-static void PacoteRecebidoNoNids(Ptr<const Packet> p)
+static void OnNidsPacketReceived(Ptr<const Packet> p)
 {
-    // Tentar inspecionar; se saturado, fail-open permite passagem.
-    bool ehAtaque = false;
-    // Recriar headers: fila do PointToPoint contém PPP + IPv4 + UDP
-    Ptr<Packet> copia = p->Copy();
+    bool isAttack = false;
+    Ptr<Packet> copy = p->Copy();
     PppHeader ppp;
-    if (copia->RemoveHeader(ppp))
+    if (copy->RemoveHeader(ppp))
     {
         const uint16_t PPP_PROTO_IPV4 = 0x0021;
         if (ppp.GetProtocol() == PPP_PROTO_IPV4)
         {
             Ipv4Header ip4;
-            if (copia->RemoveHeader(ip4))
+            if (copy->RemoveHeader(ip4))
             {
                 const uint8_t PROTO_UDP = 17;
                 if (ip4.GetProtocol() == PROTO_UDP)
                 {
                     UdpHeader udp;
-                    if (copia->RemoveHeader(udp))
+                    if (copy->RemoveHeader(udp))
                     {
-                        // Porta de ataque fixa (80 UDP)
-                        ehAtaque = (udp.GetDestinationPort() == 80);
+                        isAttack = (udp.GetDestinationPort() == 80);
                     }
                 }
             }
         }
     }
 
-    if (g_tokensDisponiveis >= 1.0)
+    if (g_availableTokens >= 1.0)
     {
-        g_tokensDisponiveis -= 1.0;
-        g_totalInspecionados++;
-        if (ehAtaque)
+        g_availableTokens -= 1.0;
+        g_totalInspected++;
+        if (isAttack)
         {
-            g_totalAtaquesInspecionados++;
-            g_totalAtaquesDetectados++; // considerado drop lógico (não deixaria passar em cenário ideal)
-            // Observação: não removemos fisicamente o pacote; detecção é lógica.
+            g_totalAttacksInspected++;
+            g_totalAttacksDetected++;
         }
     }
     else
     {
-        g_totalBypassCpu++;
-        if (!g_exaustaoCpuNotificada)
+        g_totalCpuBypass++;
+        if (isAttack)
         {
-            NS_LOG_UNCOND("--- EXAUSTÃO DE CPU NIDS: FAIL-OPEN INICIADO ---");
-            g_exaustaoCpuNotificada = true;
-        }
-        if (ehAtaque)
-        {
-            g_totalAtaquesBypassCpu++; // falso negativo
+            g_totalAttacksCpuBypass++;
         }
     }
 }
 
-// Bridge para o trace Dequeue da fila do NIDS (precisa vir DEPOIS da definição de PacoteRecebidoNoNids)
-static void OnDequeueNids(Ptr<const Packet> p)
+static void OnNidsDequeue(Ptr<const Packet> p)
 {
-    PacoteRecebidoNoNids(p);
+    OnNidsPacketReceived(p);
 }
 
 int main(int argc, char* argv[])
 {
-    double taxaPpsFundoPorCliente = 5000;
-    uint32_t packetSizeFundo = 128;
+    double backgroundPpsPerClient = 5000;
+    uint32_t backgroundPacketSize = 128;
     std::string nidsDataRate = "30Mbps";
-    std::string tamanhoFilaNids = "100p";
-    uint32_t semente = 1;
-    double nidsCpuPps = 50000.0; // capacidade default
+    std::string nidsQueueSize = "100p";
+    uint32_t seed = 1;
+    double nidsCpuPps = 50000.0;
 
     CommandLine cmd;
-    cmd.AddValue("taxaPpsFundo", "Taxa (pps) de cada cliente de fundo", taxaPpsFundoPorCliente);
-    cmd.AddValue("packetSizeFundo", "Tamanho (bytes) dos pacotes de fundo", packetSizeFundo);
+    cmd.AddValue("backgroundPps", "Taxa (pps) de cada cliente de fundo", backgroundPpsPerClient);
+    cmd.AddValue("backgroundPktSize", "Tamanho (bytes) dos pacotes de fundo", backgroundPacketSize);
     cmd.AddValue("nidsDataRate", "Capacidade (DataRate) do link do NIDS", nidsDataRate);
-    cmd.AddValue("tamanhoFilaNids", "Tamanho da fila (ex: '100p') do NIDS", tamanhoFilaNids);
-    cmd.AddValue("semente", "Semente do gerador aleatório", semente);
+    cmd.AddValue("nidsQueueSize", "Tamanho da fila (ex: '100p') do NIDS", nidsQueueSize);
+    cmd.AddValue("seed", "Semente do gerador aleatório", seed);
     cmd.AddValue("nidsCpuPps", "Capacidade de inspeção do NIDS (pps)", nidsCpuPps);
     cmd.Parse(argc, argv);
 
     g_nidsCpuPps = nidsCpuPps;
-    g_tokensDisponiveis = g_nidsCpuPps; // iniciar com capacidade cheia
+    g_availableTokens = g_nidsCpuPps;
     Simulator::Schedule(Seconds(1.0), &RefillCpuTokens);
 
-    RngSeedManager::SetSeed(semente);
+    RngSeedManager::SetSeed(seed);
     double simTime = 10.0;
 
-    uint32_t nClientesFundo = 5;
-    NodeContainer nosClientesFundo;
-    nosClientesFundo.Create(nClientesFundo);
+    uint32_t numBackgroundClients = 5;
+    NodeContainer backgroundClientNodes;
+    backgroundClientNodes.Create(numBackgroundClients);
 
-    NodeContainer noAtacante;
-    noAtacante.Create(1);
+    NodeContainer attackerNode;
+    attackerNode.Create(1);
 
-    NodeContainer noClienteLegitimo;
-    noClienteLegitimo.Create(1);
+    NodeContainer legitimateClientNode;
+    legitimateClientNode.Create(1);
 
-    NodeContainer todosClientes;
-    todosClientes.Add(nosClientesFundo);
-    todosClientes.Add(noAtacante);
-    todosClientes.Add(noClienteLegitimo);
+    NodeContainer allClientNodes;
+    allClientNodes.Add(backgroundClientNodes);
+    allClientNodes.Add(attackerNode);
+    allClientNodes.Add(legitimateClientNode);
 
-    NodeContainer noRoteadorClientes;
-    noRoteadorClientes.Create(1);
-    Ptr<Node> ptrRoteadorClientes = noRoteadorClientes.Get(0);
+    NodeContainer clientRouterNode;
+    clientRouterNode.Create(1);
+    Ptr<Node> clientRouterPtr = clientRouterNode.Get(0);
 
-    NodeContainer noRoteadorNids;
-    noRoteadorNids.Create(1);
-    Ptr<Node> ptrRoteadorNids = noRoteadorNids.Get(0);
+    NodeContainer nidsRouterNode;
+    nidsRouterNode.Create(1);
+    Ptr<Node> nidsRouterPtr = nidsRouterNode.Get(0);
 
-    NodeContainer noServidor;
-    noServidor.Create(1);
-    Ptr<Node> ptrServidor = noServidor.Get(0);
+    NodeContainer serverNode;
+    serverNode.Create(1);
+    Ptr<Node> serverPtr = serverNode.Get(0);
 
-    NodeContainer todosNos;
-    todosNos.Add(todosClientes);
-    todosNos.Add(noRoteadorClientes);
-    todosNos.Add(noRoteadorNids);
-    todosNos.Add(noServidor);
+    NodeContainer allNodes;
+    allNodes.Add(allClientNodes);
+    allNodes.Add(clientRouterNode);
+    allNodes.Add(nidsRouterNode);
+    allNodes.Add(serverNode);
 
-    PointToPointHelper p2pLinksRapidos;
-    p2pLinksRapidos.SetDeviceAttribute("DataRate", StringValue("1Gbps"));
-    p2pLinksRapidos.SetChannelAttribute("Delay", StringValue("2ms"));
+    PointToPointHelper fastP2pLinks;
+    fastP2pLinks.SetDeviceAttribute("DataRate", StringValue("1Gbps"));
+    fastP2pLinks.SetChannelAttribute("Delay", StringValue("2ms"));
 
-    PointToPointHelper p2pLinkNids;
-    p2pLinkNids.SetDeviceAttribute("DataRate", StringValue(nidsDataRate));
-    p2pLinkNids.SetChannelAttribute("Delay", StringValue("1ms"));
-    p2pLinkNids.SetQueue("ns3::DropTailQueue", "MaxSize", StringValue(tamanhoFilaNids));
+    PointToPointHelper nidsP2pLink;
+    nidsP2pLink.SetDeviceAttribute("DataRate", StringValue(nidsDataRate));
+    nidsP2pLink.SetChannelAttribute("Delay", StringValue("1ms"));
+    nidsP2pLink.SetQueue("ns3::DropTailQueue", "MaxSize", StringValue(nidsQueueSize));
 
-    NetDeviceContainer devsClientesRoteador;
-    for (uint32_t i = 0; i < todosClientes.GetN(); ++i)
+    NetDeviceContainer clientRouterDevices;
+    for (uint32_t i = 0; i < allClientNodes.GetN(); ++i)
     {
-        NetDeviceContainer link = p2pLinksRapidos.Install(todosClientes.Get(i), ptrRoteadorClientes);
-        devsClientesRoteador.Add(link);
+        NetDeviceContainer link = fastP2pLinks.Install(allClientNodes.Get(i), clientRouterPtr);
+        clientRouterDevices.Add(link);
     }
 
-    NetDeviceContainer linkNids = p2pLinkNids.Install(ptrRoteadorClientes, ptrRoteadorNids);
-    NetDeviceContainer linkServidor = p2pLinksRapidos.Install(ptrRoteadorNids, ptrServidor);
+    NetDeviceContainer nidsLinkDevices = nidsP2pLink.Install(clientRouterPtr, nidsRouterPtr);
+    NetDeviceContainer serverLinkDevices = fastP2pLinks.Install(nidsRouterPtr, serverPtr);
 
     InternetStackHelper stack;
-    stack.Install(todosNos);
+    stack.Install(allNodes);
 
     Ipv4AddressHelper addrHelper;
-    Ipv4Address ipServidor;
-    Ipv4Address ipLegitimo;
+    Ipv4Address serverIp;
+    Ipv4Address legitimateIp;
 
-    for (uint32_t i = 0; i < todosClientes.GetN(); ++i)
+    for (uint32_t i = 0; i < allClientNodes.GetN(); ++i)
     {
         NetDeviceContainer linkDevices;
-        linkDevices.Add(devsClientesRoteador.Get(i * 2));
-        linkDevices.Add(devsClientesRoteador.Get(i * 2 + 1));
+        linkDevices.Add(clientRouterDevices.Get(i * 2));
+        linkDevices.Add(clientRouterDevices.Get(i * 2 + 1));
 
         std::string subnet = "10.1." + std::to_string(i + 1) + ".0";
         addrHelper.SetBase(Ipv4Address(subnet.c_str()), "255.255.255.252");
-        Ipv4InterfaceContainer ifacesLink = addrHelper.Assign(linkDevices);
+        Ipv4InterfaceContainer linkInterfaces = addrHelper.Assign(linkDevices);
 
-        if (i == (nClientesFundo + 1))
+        if (i == (numBackgroundClients + 1))
         {
-            ipLegitimo = ifacesLink.GetAddress(0);
+            legitimateIp = linkInterfaces.GetAddress(0);
         }
     }
 
     addrHelper.SetBase("10.2.1.0", "255.255.255.252");
-    addrHelper.Assign(linkNids);
+    addrHelper.Assign(nidsLinkDevices);
 
     addrHelper.SetBase("10.3.1.0", "255.255.255.252");
-    Ipv4InterfaceContainer ifaceServidor = addrHelper.Assign(linkServidor);
-    ipServidor = ifaceServidor.GetAddress(1);
+    Ipv4InterfaceContainer serverInterface = addrHelper.Assign(serverLinkDevices);
+    serverIp = serverInterface.GetAddress(1);
 
     Ipv4GlobalRoutingHelper::PopulateRoutingTables();
 
-    uint16_t portFundo = 9;
-    PacketSinkHelper sinkFundo("ns3::UdpSocketFactory", InetSocketAddress(Ipv4Address::GetAny(), portFundo));
-    ApplicationContainer appsServidor = sinkFundo.Install(noServidor.Get(0));
+    uint16_t backgroundPort = 9;
+    PacketSinkHelper backgroundSinkHelper("ns3::UdpSocketFactory", InetSocketAddress(Ipv4Address::GetAny(), backgroundPort));
+    ApplicationContainer serverApps = backgroundSinkHelper.Install(serverNode.Get(0));
 
-    uint16_t portAtaque = 80;
-    PacketSinkHelper sinkAtaqueHelper("ns3::UdpSocketFactory", InetSocketAddress(Ipv4Address::GetAny(), portAtaque));
-    ApplicationContainer appSinkAtaque = sinkAtaqueHelper.Install(noServidor.Get(0));
-    g_sinkAtaque = DynamicCast<PacketSink>(appSinkAtaque.Get(0));
-    appsServidor.Add(appSinkAtaque);
+    uint16_t attackPort = 80;
+    PacketSinkHelper attackSinkHelper("ns3::UdpSocketFactory", InetSocketAddress(Ipv4Address::GetAny(), attackPort));
+    ApplicationContainer attackSinkApp = attackSinkHelper.Install(serverNode.Get(0));
+    g_attackSink = DynamicCast<PacketSink>(attackSinkApp.Get(0));
+    serverApps.Add(attackSinkApp);
 
-    uint16_t portLegitimo = 8080;
-    PacketSinkHelper sinkLegitimo("ns3::TcpSocketFactory", InetSocketAddress(Ipv4Address::GetAny(), portLegitimo));
-    ApplicationContainer appSinkLegitimo = sinkLegitimo.Install(noServidor.Get(0));
-    g_sinkLegitimo = DynamicCast<PacketSink>(appSinkLegitimo.Get(0));
-    appsServidor.Add(appSinkLegitimo);
+    uint16_t legitimatePort = 8080;
+    PacketSinkHelper legitimateSinkHelper("ns3::TcpSocketFactory", InetSocketAddress(Ipv4Address::GetAny(), legitimatePort));
+    ApplicationContainer legitimateSinkApp = legitimateSinkHelper.Install(serverNode.Get(0));
+    g_legitimateSink = DynamicCast<PacketSink>(legitimateSinkApp.Get(0));
+    serverApps.Add(legitimateSinkApp);
 
-    appsServidor.Start(Seconds(0.0));
-    appsServidor.Stop(Seconds(simTime));
+    serverApps.Start(Seconds(0.0));
+    serverApps.Stop(Seconds(simTime));
 
-    ApplicationContainer appsClientesFundo;
-    std::string dataRateFundo = std::to_string(taxaPpsFundoPorCliente * packetSizeFundo * 8) + "bps";
-    OnOffHelper onoffFundo("ns3::UdpSocketFactory", InetSocketAddress(ipServidor, portFundo));
-    onoffFundo.SetAttribute("PacketSize", UintegerValue(packetSizeFundo));
-    onoffFundo.SetAttribute("DataRate", StringValue(dataRateFundo));
-    onoffFundo.SetAttribute("OnTime", StringValue("ns3::ConstantRandomVariable[Constant=1]"));
-    onoffFundo.SetAttribute("OffTime", StringValue("ns3::ConstantRandomVariable[Constant=0]"));
-    for (uint32_t i = 0; i < nClientesFundo; ++i)
+    ApplicationContainer backgroundClientApps;
+    std::string backgroundDataRate = std::to_string(backgroundPpsPerClient * backgroundPacketSize * 8) + "bps";
+    OnOffHelper backgroundOnOffHelper("ns3::UdpSocketFactory", InetSocketAddress(serverIp, backgroundPort));
+    backgroundOnOffHelper.SetAttribute("PacketSize", UintegerValue(backgroundPacketSize));
+    backgroundOnOffHelper.SetAttribute("DataRate", StringValue(backgroundDataRate));
+    backgroundOnOffHelper.SetAttribute("OnTime", StringValue("ns3::ConstantRandomVariable[Constant=1]"));
+    backgroundOnOffHelper.SetAttribute("OffTime", StringValue("ns3::ConstantRandomVariable[Constant=0]"));
+    for (uint32_t i = 0; i < numBackgroundClients; ++i)
     {
-        appsClientesFundo.Add(onoffFundo.Install(nosClientesFundo.Get(i)));
+        backgroundClientApps.Add(backgroundOnOffHelper.Install(backgroundClientNodes.Get(i)));
     }
-    appsClientesFundo.Start(Seconds(1.0));
-    appsClientesFundo.Stop(Seconds(simTime - 1.0));
+    backgroundClientApps.Start(Seconds(1.0));
+    backgroundClientApps.Stop(Seconds(simTime - 1.0));
 
-    uint32_t packetSizeAtaque = 1024;
-    uint32_t totalPacotesAtaque = 100;
-    uint32_t totalBytesAtaque = packetSizeAtaque * totalPacotesAtaque;
-    OnOffHelper onoffAtaque("ns3::UdpSocketFactory", InetSocketAddress(ipServidor, portAtaque));
-    onoffAtaque.SetAttribute("PacketSize", UintegerValue(packetSizeAtaque));
-    onoffAtaque.SetAttribute("DataRate", StringValue("500kbps"));
-    onoffAtaque.SetAttribute("MaxBytes", UintegerValue(totalBytesAtaque));
-    onoffAtaque.SetAttribute("OnTime", StringValue("ns3::ConstantRandomVariable[Constant=1]"));
-    onoffAtaque.SetAttribute("OffTime", StringValue("ns3::ConstantRandomVariable[Constant=0]"));
-    ApplicationContainer appsAtacante = onoffAtaque.Install(noAtacante.Get(0));
-    appsAtacante.Start(Seconds(2.0));
-    appsAtacante.Stop(Seconds(simTime - 2.0));
-    g_totalAtaquesEnviados = totalPacotesAtaque;
+    uint32_t attackPacketSize = 1024;
+    uint32_t totalAttackPackets = 100;
+    uint32_t totalAttackBytes = attackPacketSize * totalAttackPackets;
+    OnOffHelper attackOnOffHelper("ns3::UdpSocketFactory", InetSocketAddress(serverIp, attackPort));
+    attackOnOffHelper.SetAttribute("PacketSize", UintegerValue(attackPacketSize));
+    attackOnOffHelper.SetAttribute("DataRate", StringValue("500kbps"));
+    attackOnOffHelper.SetAttribute("MaxBytes", UintegerValue(totalAttackBytes));
+    attackOnOffHelper.SetAttribute("OnTime", StringValue("ns3::ConstantRandomVariable[Constant=1]"));
+    attackOnOffHelper.SetAttribute("OffTime", StringValue("ns3::ConstantRandomVariable[Constant=0]"));
+    ApplicationContainer attackerApps = attackOnOffHelper.Install(attackerNode.Get(0));
+    attackerApps.Start(Seconds(2.0));
+    attackerApps.Stop(Seconds(simTime - 2.0));
+    g_totalAttacksSent = totalAttackPackets;
 
-    // Log periódico de estado de CPU (a cada segundo)
     for (uint32_t s = 1; s <= (uint32_t)simTime; ++s)
     {
         Simulator::Schedule(Seconds(s), [](){
             NS_LOG_UNCOND("[CPU] t=" << Simulator::Now().GetSeconds()
-                           << "s tokens_restantes=" << g_tokensDisponiveis
-                           << " inspecionados=" << g_totalInspecionados
-                           << " bypass=" << g_totalBypassCpu
-                           << " ataques_bypass=" << g_totalAtaquesBypassCpu);
+                                     << "s tokens_restantes=" << g_availableTokens
+                                     << " inspecionados=" << g_totalInspected
+                                     << " bypass=" << g_totalCpuBypass
+                                     << " ataques_bypass=" << g_totalAttacksCpuBypass);
         });
     }
 
-    BulkSendHelper bulkSend("ns3::TcpSocketFactory", InetSocketAddress(ipServidor, portLegitimo));
+    BulkSendHelper bulkSend("ns3::TcpSocketFactory", InetSocketAddress(serverIp, legitimatePort));
     bulkSend.SetAttribute("MaxBytes", UintegerValue(0));
-    ApplicationContainer appClienteLegitimo = bulkSend.Install(noClienteLegitimo.Get(0));
-    appClienteLegitimo.Start(Seconds(1.0));
-    appClienteLegitimo.Stop(Seconds(simTime));
+    ApplicationContainer legitimateClientApp = bulkSend.Install(legitimateClientNode.Get(0));
+    legitimateClientApp.Start(Seconds(1.0));
+    legitimateClientApp.Stop(Seconds(simTime));
 
-    Ptr<NetDevice> devNidsSaida = linkNids.Get(0);
-    Ptr<PointToPointNetDevice> p2pDev = DynamicCast<PointToPointNetDevice>(devNidsSaida);
-    Ptr<Queue<Packet>> filaNids = p2pDev->GetQueue();
-    filaNids->TraceConnectWithoutContext("Enqueue", MakeCallback(&PacoteNaFila));
-    // Conecta drop direto na fila (não depende de QueueDisc)
-    filaNids->TraceConnectWithoutContext("Drop", MakeCallback(&PacoteDescartado));
+    Ptr<NetDevice> nidsOutDevice = nidsLinkDevices.Get(0);
+    Ptr<PointToPointNetDevice> p2pDev = DynamicCast<PointToPointNetDevice>(nidsOutDevice);
+    Ptr<Queue<Packet>> nidsQueue = p2pDev->GetQueue();
+    nidsQueue->TraceConnectWithoutContext("Enqueue", MakeCallback(&OnPacketEnqueued));
+    nidsQueue->TraceConnectWithoutContext("Drop", MakeCallback(&OnPacketDropped));
 
-    // Inspeção lógica ao sair da fila rumo ao NIDS (proxy para "chegada" ao NIDS)
-    filaNids->TraceConnectWithoutContext("Dequeue", MakeCallback(&OnDequeueNids));
+    nidsQueue->TraceConnectWithoutContext("Dequeue", MakeCallback(&OnNidsDequeue));
 
     Ptr<TrafficControlLayer> tc = p2pDev->GetNode()->GetObject<TrafficControlLayer>();
     if (tc != nullptr)
     {
-        Ptr<QueueDisc> queueDiscNids = tc->GetRootQueueDiscOnDevice(p2pDev);
-        if (queueDiscNids != nullptr)
+        Ptr<QueueDisc> nidsQueueDisc = tc->GetRootQueueDiscOnDevice(p2pDev);
+        if (nidsQueueDisc != nullptr)
         {
-            queueDiscNids->TraceConnectWithoutContext("Drop", MakeCallback(&PacoteDescartadoDisc));
+            nidsQueueDisc->TraceConnectWithoutContext("Drop", MakeCallback(&OnPacketDroppedDisc));
         }
         else
         {
@@ -319,52 +303,49 @@ int main(int argc, char* argv[])
     Simulator::Stop(Seconds(simTime + 1.0));
     Simulator::Run();
 
-    NS_LOG_UNCOND("--- Contadores Finais ---");
-    NS_LOG_UNCOND("Total Pacotes Enfileirados: " << g_totalPacotesFila);
-    NS_LOG_UNCOND("Total Pacotes Descartados: " << g_totalDescartes);
-    // Ataques descartados por fila não são diretamente observáveis aqui (sem L3); ver taxa abaixo.
-    NS_LOG_UNCOND("Total Inspecionados (CPU): " << g_totalInspecionados);
-    NS_LOG_UNCOND("Total Bypass CPU (Fail-Open): " << g_totalBypassCpu);
-    NS_LOG_UNCOND("Ataques Inspecionados: " << g_totalAtaquesInspecionados);
-    NS_LOG_UNCOND("Ataques Detectados (drop lógico): " << g_totalAtaquesDetectados);
-    NS_LOG_UNCOND("Ataques Bypass CPU (FNs): " << g_totalAtaquesBypassCpu);
+    NS_LOG_UNCOND("Total Pacotes Enfileirados: " << g_totalQueuePackets);
+    NS_LOG_UNCOND("Total Pacotes Descartados: " << g_totalDrops);
+    NS_LOG_UNCOND("Total Inspecionados (CPU): " << g_totalInspected);
+    NS_LOG_UNCOND("Total Bypass CPU (Fail-Open): " << g_totalCpuBypass);
+    NS_LOG_UNCOND("Ataques Inspecionados: " << g_totalAttacksInspected);
+    NS_LOG_UNCOND("Ataques Detectados (drop lógico): " << g_totalAttacksDetected);
+    NS_LOG_UNCOND("Ataques Bypass CPU (FNs): " << g_totalAttacksCpuBypass);
 
-    double taxaDescarteGeral = 0.0;
-    if (g_totalPacotesFila > 0)
+    double overallDropRate = 0.0;
+    if (g_totalQueuePackets > 0)
     {
-        taxaDescarteGeral = (double)g_totalDescartes / g_totalPacotesFila;
+        overallDropRate = (double)g_totalDrops / g_totalQueuePackets;
     }
 
-    // Falsos negativos definidos como: (Ataques Enviados - Ataques Recebidos no Sink) / Ataques Enviados
-    double ataquesRecebidos = 0.0;
-    if (g_sinkAtaque)
+    double attacksReceived = 0.0;
+    if (g_attackSink)
     {
-        ataquesRecebidos = g_sinkAtaque->GetTotalRx() / (double)packetSizeAtaque;
+        attacksReceived = g_attackSink->GetTotalRx() / (double)attackPacketSize;
     }
-    // False negatives computados estritamente como ataques que bypassaram CPU (não inspecionados) / enviados.
-    double taxaFalsosNegativos = 0.0;
-    if (totalPacotesAtaque > 0)
-    {
-        taxaFalsosNegativos = (double)g_totalAtaquesBypassCpu / (double)totalPacotesAtaque;
-    }
-    NS_LOG_UNCOND("Ataques Enviados: " << totalPacotesAtaque
-                   << " | Recebidos (servidor): " << ataquesRecebidos
-                   << " | Detectados(lógico): " << g_totalAtaquesDetectados
-                   << " | Bypass(FN): " << g_totalAtaquesBypassCpu);
-    NS_LOG_UNCOND("Taxa Falsos Negativos (bypass/enviados): " << taxaFalsosNegativos);
 
-    double throughputLegitimoMbps = 0.0;
-    if (g_sinkLegitimo)
+    double falseNegativeRate = 0.0;
+    if (totalAttackPackets > 0)
     {
-        uint64_t totalBytesRecebidos = g_sinkLegitimo->GetTotalRx();
-        NS_LOG_UNCOND("Total Bytes TCP Recebidos: " << totalBytesRecebidos);
-        double duracaoApp = simTime - 1.0;
-        throughputLegitimoMbps = (totalBytesRecebidos * 8.0) / (duracaoApp * 1000000.0);
+        falseNegativeRate = (double)g_totalAttacksCpuBypass / (double)totalAttackPackets;
+    }
+    NS_LOG_UNCOND("Ataques Enviados: " << totalAttackPackets
+                                       << " | Recebidos (servidor): " << attacksReceived
+                                       << " | Detectados(lógico): " << g_totalAttacksDetected
+                                       << " | Bypass(FN): " << g_totalAttacksCpuBypass);
+    NS_LOG_UNCOND("Taxa Falsos Negativos (bypass/enviados): " << falseNegativeRate);
+
+    double legitimateThroughputMbps = 0.0;
+    if (g_legitimateSink)
+    {
+        uint64_t totalBytesReceived = g_legitimateSink->GetTotalRx();
+        NS_LOG_UNCOND("Total Bytes TCP Recebidos: " << totalBytesReceived);
+        double appDuration = simTime - 1.0;
+        legitimateThroughputMbps = (totalBytesReceived * 8.0) / (appDuration * 1000000.0);
     }
 
     monitor->CheckForLostPackets();
     FlowMonitor::FlowStatsContainer stats = monitor->GetFlowStats();
-    double mediaLatencia = 0.0;
+    double avgLatency = 0.0;
 
     for (auto const& kv : stats)
     {
@@ -372,24 +353,25 @@ int main(int argc, char* argv[])
         FlowMonitor::FlowStats flowStats = kv.second;
         Ipv4FlowClassifier::FiveTuple t = classifier->FindFlow(flowId);
 
-        if (t.sourceAddress == ipLegitimo &&
-            t.destinationAddress == ipServidor &&
-            t.destinationPort == portLegitimo)
+        if (t.sourceAddress == legitimateIp &&
+            t.destinationAddress == serverIp &&
+            t.destinationPort == legitimatePort)
         {
             if (flowStats.rxPackets > 0)
             {
-                mediaLatencia = flowStats.delaySum.GetSeconds() / flowStats.rxPackets;
-                NS_LOG_UNCOND("Latência Média TCP: " << mediaLatencia << "s");
+                avgLatency = (flowStats.delaySum.GetSeconds() / flowStats.rxPackets) * 1000;
+                NS_LOG_UNCOND("Latência Média TCP: " << avgLatency << "s");
             }
             break;
         }
     }
 
+    // NÃO APAGAR, É A SAÍDA DO RESULTADO PARA O SCRIPT DE ANÁLISE
     std::cout << "RESULT,"
-              << taxaDescarteGeral << ","
-              << taxaFalsosNegativos << ","
-              << throughputLegitimoMbps << ","
-              << mediaLatencia << std::endl;
+              << overallDropRate << ","
+              << falseNegativeRate << ","
+              << legitimateThroughputMbps << ","
+              << avgLatency << std::endl;
 
     Simulator::Destroy();
     return 0;
